@@ -2,44 +2,47 @@
 
 namespace App\Command;
 
-use Psr\Log\LoggerInterface;
-use Symfony\Component\DomCrawler\Crawler;
+use App\Service\SongService;
+use App\Service\ProfileService;
+use Symfony\Component\Console\Helper\Table;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputOption;
-use Symfony\Component\Console\Helper\ProgressBar;
 use Symfony\Component\Console\Style\SymfonyStyle;
-use Symfony\Component\HttpKernel\KernelInterface;
 use Symfony\Component\Console\Input\InputArgument;
-use Symfony\Component\String\Slugger\AsciiSlugger;
 use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Helper\TableSeparator;
 use Symfony\Component\Console\Output\OutputInterface;
-use Symfony\Contracts\HttpClient\HttpClientInterface;
 
 class DownloadCommand extends Command
 {
+    /**
+     * Command to run on the terminal
+     *
+     * @var string
+     */
     protected static $defaultName = 'app:download';
 
-    private $client;
-
-    private $appKernel;
-
-    private $logger;
-
-    private $length = 0;
-
-    private $offset = 575;
-
+    /**
+     * @var ProfileService
+     */
+    private $profileService;
 
     /**
-     * @param HttpClientInterface $client
-     * @param KernelInterface $appKernel
-     * @param LoggerInterface $logger
+     * @var SongService
      */
-    public function __construct(HttpClientInterface $client, KernelInterface $appKernel, LoggerInterface $songsLogger)
+    private $songService;
+
+    /**
+     * @param ProfileService $profileService
+     * @param SongService $songService
+     */
+    public function __construct(
+        ProfileService $profileService,
+        SongService $songService
+    )
     {
-        $this->client = $client;
-        $this->appKernel = $appKernel;
-        $this->logger = $songsLogger;
+        $this->profileService = $profileService;
+        $this->songService = $songService;
 
         parent::__construct();
     }
@@ -49,9 +52,21 @@ class DownloadCommand extends Command
         $this
             ->setDescription('Download the reccorded musics of a user on Smule')
             ->addArgument('username', InputArgument::REQUIRED, 'Smule username')
+            ->addOption(
+                'force',
+                null,
+                InputOption::VALUE_OPTIONAL,
+                'Do you want to refresh your database ?',
+                false
+            )
         ;
     }
 
+    /**
+     * @param InputInterface $input
+     * @param OutputInterface $output
+     * @return integer
+     */
     protected function execute(InputInterface $input, OutputInterface $output): int
     {   
         $io = new SymfonyStyle($input, $output);
@@ -63,106 +78,50 @@ class DownloadCommand extends Command
             '',
         ]);
 
-        while($this->offset !== -1)
-        {
-            $this->downloadSong($username, $output);
-        }
-
-        $io->success('You have downloaded ' . $this->length . 'songs');
-
-        return Command::SUCCESS;
-    }
-
-    private function downloadSong(string $username, OutputInterface $output)
-    {
-        $response = $this->client->request(
-            'GET',
-            'https://www.smule.com/s/profile/performance/'. $username .'/sing?offset='. $this->offset .'&size=0'
-        );
-
-        $statusCode = $response->getStatusCode();
-        $contentType = $response->getHeaders()['content-type'][0];
-        $content = $response->getContent();
-        $content = $response->toArray();
-
-        $songs = $content['list'];
-
-        $this->length += count($songs);
-
-        $this->offset = $content['next_offset'];
-        $slugger = new AsciiSlugger();
-
-        $progressBar = new ProgressBar($output);
-        foreach($progressBar->iterate($songs) as $song)
-        {
-            // get song page url
-            $song_url = $song['web_url'];
-
-            $response = $this->client->request(
-                'GET',
-                'https://smule.com/recording' . $song_url
-            );
-            
-            $statusCode = $response->getStatusCode();
-            if($response->getStatusCode() !== 200)
-            {
-                $output->writeln([
-                    "",
-                    "<error>Failed to download :". $song_url . "=>" . $song['title'] . "</error>"
-                ]);
-                continue;
-            }
-            $contentType = $response->getHeaders()['content-type'][0];
-
-            // retrieve song file link
-            $html = $response->getContent();
-            $crawler = new Crawler($html);
-            $url = $crawler->filterXpath("//meta[@name='twitter:player:stream']")->extract(array('content'));
-
-            if(empty($url)){
-                $output->writeln([
-                    "",
-                    "<error>Failed to download :". $song_url . "=>" . $song['title'] . "</error>"
-                ]);
-                $this->logger->error("Missing link for song : " . $song['title'] . ", url :" . $song_url);
-                continue;
-            }
-
-            $url = $url[0];
-
-            // download the song
-            $response = $this->client->request(
-                'GET',
-                $url
-            );
-
-            if($response->getStatusCode() !== 200)
-            {
-                $output->writeln([
-                    "",
-                    "<error>Failed to download :". $url . "=>" . $song['title'] . "</error>"
-                ]);                continue;
-            }
-
-            // Create a unique song title
-            
-            $mimeType = $response->getHeaders()["content-type"][0];
-            $parts = explode('/', $mimeType);
-            $ext = array_pop($parts);
-
-            $song_original_title = $song['title'];
-            $song_slugged_title = $slugger->slug($song_original_title);
-            $song_unique_title = $username . '_' . $song_slugged_title . '_' . $song['key'] . '.' . $ext;
-
-            $file = $this->appKernel->getProjectDir() . '/public/' . $song['type'] . '/' . $song_unique_title;
-            file_put_contents($file, $response->getContent());
-        }
-
         $output->writeln([
             '',
-            '',
-            'Downloaded: '. $this->length,
+            'Checking for user ' . $username . ' on Smule.com',
             '',
         ]);
+
+        $profile = $this->profileService->getProfile($username, $output);
+
+        $forceDownload = $input->getOption('force');
+
+        if(false === $forceDownload)
+        {
+            $output->writeln([
+            '',
+            '<info>Skipping soung retrieving step, only reffering to data already in base</info>',
+            '',
+            ]);
+        } else {
+            $this->songService->retrieveSongs($profile, $output);
+        }
+            
+        $this->songService->downloadSongs($profile, $output);
+
+        $result = $this->songService->getSongsInfo($profile);
+
+        $table = new Table($output);
+        $table
+            ->setHeaders(['Type', 'Items'])
+            ->setRows([
+                ['Audio', $result['audio']],
+                ['Video', $result['video']],
+                new TableSeparator(),
+                ['Downloaded', $result['downloaded']],
+                ['To download', $result['active']],
+                ['To fix', $result['inactive']],
+                ['Deleted', $result['deleted']],
+                new TableSeparator(),
+                ['TOTAL', $result['total']],
+            ])
+        ;
+        $table->render();
+
+        $io->success('Download done');
+
+        return Command::SUCCESS;
     }
 }
